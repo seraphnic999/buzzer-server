@@ -7,13 +7,16 @@ const dictionary = require('./dictionary.json');
 const app = express();
 app.use(cors());
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: ["https://buzzer-client-ten.vercel.app", "http://localhost:5173"], methods: ["GET", "POST"] } });
+const io = new Server(server, {
+  cors: {
+    origin: ["https://buzzer-client-ten.vercel.app", "http://localhost:5173"],
+    methods: ["GET", "POST"],
+  },
+});
 const PORT = process.env.PORT || 3002;
 
-// ── Constants ──────────────────────────────────────────────────────────────
-const CLUE_INTERVAL_MS = 3500;   // ms between clues
-const GRACE_PERIOD_MS  = 6000;   // ms after last clue before auto round-end
-const ANSWER_TIMEOUT_MS = 15000; // ms player has to pick from grid
+const CLUE_INTERVAL_MS = 3500;
+const GRACE_PERIOD_MS  = 6000;
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 const LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -32,21 +35,29 @@ function shuffle(arr) {
 // ── Room store ─────────────────────────────────────────────────────────────
 const rooms = {};
 
-function createRoom(hostSocketId) {
+function createRoom(hostSocketId, settings = {}) {
   const code = generateCode();
   rooms[code] = {
     code,
     hostSocketId,
     phase: 'lobby',       // lobby | clues_running | player_answering | round_over
-    players: {},          // socketId → { name, score, eliminatedThisRound }
+    settings: {
+      answerTimeout: settings.answerTimeout || 10, // seconds
+      mode: settings.mode || 'hard',               // easy | hard | chaos
+    },
+    players: {},           // socketId → { name, score, eliminatedThisRound }
     wordQueue: shuffle(Object.keys(dictionary)),
     wordQueueIndex: 0,
     roundNumber: 0,
     currentClueIndex: 0,
-    revealedClues: [],    // [{ index, text }]
+    revealedClues: [],
+    // easy/hard: single answerer
     answeringPlayerId: null,
-    clueTimer: null,
     answerTimer: null,
+    // chaos: multiple simultaneous answerers
+    activeAnswerers: {},   // socketId → true
+    answerTimers: {},      // socketId → timeout handle
+    clueTimer: null,
   };
   return code;
 }
@@ -57,25 +68,33 @@ function currentEntry(room) {
 }
 
 function roomState(room) {
+  const { mode } = room.settings;
+  // For host display: who is currently in the grid
+  const activeNames = mode === 'chaos'
+    ? Object.keys(room.activeAnswerers).map(id => room.players[id]?.name).filter(Boolean)
+    : (room.answeringPlayerId ? [room.players[room.answeringPlayerId]?.name].filter(Boolean) : []);
+
   return {
     code: room.code,
     phase: room.phase,
     roundNumber: room.roundNumber,
+    settings: room.settings,
     players: Object.entries(room.players).map(([id, p]) => ({
       id, name: p.name, score: p.score, eliminatedThisRound: p.eliminatedThisRound,
     })),
     revealedClues: room.revealedClues,
     totalClues: currentEntry(room).entry?.clues?.length ?? 0,
-    answeringPlayerName: room.answeringPlayerId
-      ? (room.players[room.answeringPlayerId]?.name ?? null)
-      : null,
+    activeAnswererNames: activeNames,
   };
 }
 
 // ── Timer helpers ──────────────────────────────────────────────────────────
-function stopTimers(room) {
+function stopAllTimers(room) {
   if (room.clueTimer)  { clearTimeout(room.clueTimer);  room.clueTimer  = null; }
   if (room.answerTimer){ clearTimeout(room.answerTimer); room.answerTimer = null; }
+  for (const id of Object.keys(room.answerTimers || {})) clearTimeout(room.answerTimers[id]);
+  room.answerTimers = {};
+  room.activeAnswerers = {};
 }
 
 function scheduleNextClue(roomCode) {
@@ -86,34 +105,31 @@ function scheduleNextClue(roomCode) {
   const idx = room.currentClueIndex;
 
   if (idx >= entry.clues.length) {
-    // All clues shown — grace period then auto end
     room.clueTimer = setTimeout(() => {
       if (rooms[roomCode]?.phase === 'clues_running') endRound(roomCode, null, 0);
     }, GRACE_PERIOD_MS);
     return;
   }
 
-  // Reveal clue at idx
   const clue = entry.clues[idx];
   room.revealedClues.push({ index: idx, text: clue });
   room.currentClueIndex++;
 
   io.to(roomCode).emit('clue_revealed', {
-    clueIndex: idx,
-    clue,
+    clueIndex: idx, clue,
     revealedClues: room.revealedClues,
     totalClues: entry.clues.length,
   });
 
-  // Schedule the next one
   room.clueTimer = setTimeout(() => scheduleNextClue(roomCode), CLUE_INTERVAL_MS);
 }
 
 function endRound(roomCode, winnerId, points) {
   const room = rooms[roomCode];
   if (!room) return;
-  stopTimers(room);
+  stopAllTimers(room);
   room.phase = 'round_over';
+  room.answeringPlayerId = null;
 
   if (winnerId && room.players[winnerId]) {
     room.players[winnerId].score += points;
@@ -128,20 +144,30 @@ function endRound(roomCode, winnerId, points) {
   });
 }
 
-function eliminateAndResume(roomCode, playerId) {
+// Called after a wrong answer in easy/hard mode
+function handleWrongAnswer(roomCode, playerId) {
   const room = rooms[roomCode];
   if (!room) return;
 
-  if (room.players[playerId]) room.players[playerId].eliminatedThisRound = true;
-  room.answeringPlayerId = null;
+  const { mode } = room.settings;
+  const eliminated = mode === 'hard';
 
-  const active = Object.values(room.players).filter(p => !p.eliminatedThisRound);
-  if (active.length === 0) { endRound(roomCode, null, 0); return; }
+  room.answeringPlayerId = null;
+  room.answerTimer = null;
+
+  if (eliminated && room.players[playerId]) {
+    room.players[playerId].eliminatedThisRound = true;
+    const active = Object.values(room.players).filter(p => !p.eliminatedThisRound);
+    if (active.length === 0) { endRound(roomCode, null, 0); return; }
+  }
 
   room.phase = 'clues_running';
-  io.to(roomCode).emit('player_eliminated', { roomState: roomState(room) });
+  io.to(roomCode).emit('answer_failed', {
+    playerName: room.players[playerId]?.name,
+    eliminated,
+    roomState: roomState(room),
+  });
 
-  // Resume clue chain (advance one clue as small penalty for the pause)
   scheduleNextClue(roomCode);
 }
 
@@ -149,34 +175,31 @@ function eliminateAndResume(roomCode, playerId) {
 io.on('connection', socket => {
   console.log('connected:', socket.id);
 
-  // Host creates a room
-  socket.on('create_room', (_, cb) => {
-    const code = createRoom(socket.id);
+  socket.on('create_room', ({ settings } = {}, cb) => {
+    const code = createRoom(socket.id, settings || {});
     socket.join(code);
     socket.data.roomCode = code;
     socket.data.isHost = true;
     cb({ code, roomState: roomState(rooms[code]) });
-    console.log('Room created:', code);
+    console.log(`Room ${code} created — mode: ${rooms[code].settings.mode}, timeout: ${rooms[code].settings.answerTimeout}s`);
   });
 
-  // Player joins
   socket.on('join_room', ({ code, playerName }, cb) => {
     const room = rooms[code?.toUpperCase()];
     if (!room) return cb({ error: 'חדר לא נמצא' });
     if (!playerName?.trim()) return cb({ error: 'נא להזין שם' });
-    if (room.phase !== 'lobby' && room.phase !== 'round_over') return cb({ error: 'המשחק כבר בעיצומו — תצטרפו בסיבוב הבא' });
+    if (room.phase !== 'lobby' && room.phase !== 'round_over')
+      return cb({ error: 'המשחק כבר בעיצומו — תצטרפו בסיבוב הבא' });
 
     socket.join(code.toUpperCase());
     socket.data.roomCode = code.toUpperCase();
     socket.data.isHost = false;
-
     room.players[socket.id] = { name: playerName.trim(), score: 0, eliminatedThisRound: false };
 
     cb({ roomState: roomState(room) });
     io.to(code.toUpperCase()).emit('room_updated', roomState(room));
   });
 
-  // Host starts a round
   socket.on('start_round', (_, cb) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
@@ -190,7 +213,7 @@ io.on('connection', socket => {
     room.currentClueIndex = 0;
     room.revealedClues = [];
     room.answeringPlayerId = null;
-    stopTimers(room);
+    stopAllTimers(room);
 
     for (const pid of Object.keys(room.players)) {
       room.players[pid].eliminatedThisRound = false;
@@ -207,60 +230,104 @@ io.on('connection', socket => {
     cb?.({ ok: true });
   });
 
-  // Player presses buzzer
   socket.on('press_buzzer', (_, cb) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
-    if (!room || room.phase !== 'clues_running') return cb?.({ error: 'לא ניתן כרגע' });
+    if (!room) return cb?.({ error: 'חדר לא נמצא' });
 
     const player = room.players[socket.id];
     if (!player) return cb?.({ error: 'אינך רשום כשחקן' });
-    if (player.eliminatedThisRound) return cb?.({ error: 'אתה מחוץ לסיבוב הזה' });
 
-    stopTimers(room);
-    room.phase = 'player_answering';
-    room.answeringPlayerId = socket.id;
+    const { mode, answerTimeout } = room.settings;
+    const timeoutMs = answerTimeout * 1000;
 
-    const { entry } = currentEntry(room);
-    const shuffledGrid = shuffle(entry.grid);
+    if (mode === 'chaos') {
+      // Chaos: clues keep running, multiple can buzz simultaneously
+      if (room.phase !== 'clues_running') return cb?.({ error: 'לא ניתן כרגע' });
+      if (room.activeAnswerers[socket.id]) return cb?.({ error: 'כבר בוחר תשובה' });
 
-    io.to(code).emit('player_buzzed', {
-      playerName: player.name,
-      roomState: roomState(room),
-    });
+      room.activeAnswerers[socket.id] = true;
+      const { entry } = currentEntry(room);
 
-    // Grid goes ONLY to the buzzing player
-    socket.emit('show_grid', { grid: shuffledGrid, timeLimit: ANSWER_TIMEOUT_MS / 1000 });
+      io.to(code).emit('player_buzzed', { playerName: player.name, roomState: roomState(room) });
+      socket.emit('show_grid', { grid: shuffle(entry.grid), timeLimit: answerTimeout });
 
-    // Server-side answer timeout
-    room.answerTimer = setTimeout(() => {
-      if (rooms[code]?.phase === 'player_answering' && rooms[code]?.answeringPlayerId === socket.id) {
+      room.answerTimers[socket.id] = setTimeout(() => {
+        const r = rooms[code];
+        if (!r || !r.activeAnswerers[socket.id]) return;
+        delete r.activeAnswerers[socket.id];
+        delete r.answerTimers[socket.id];
         socket.emit('answer_result', { correct: false, timeout: true });
-        eliminateAndResume(code, socket.id);
-      }
-    }, ANSWER_TIMEOUT_MS);
+        io.to(code).emit('answer_failed', {
+          playerName: player.name, eliminated: false, roomState: roomState(r),
+        });
+      }, timeoutMs);
+
+    } else {
+      // Easy / Hard: pause clues, single answerer
+      if (room.phase !== 'clues_running') return cb?.({ error: 'לא ניתן כרגע' });
+      if (player.eliminatedThisRound) return cb?.({ error: 'אתה מחוץ לסיבוב הזה' });
+
+      stopAllTimers(room);
+      room.phase = 'player_answering';
+      room.answeringPlayerId = socket.id;
+
+      const { entry } = currentEntry(room);
+      io.to(code).emit('player_buzzed', { playerName: player.name, roomState: roomState(room) });
+      socket.emit('show_grid', { grid: shuffle(entry.grid), timeLimit: answerTimeout });
+
+      room.answerTimer = setTimeout(() => {
+        const r = rooms[code];
+        if (!r || r.phase !== 'player_answering' || r.answeringPlayerId !== socket.id) return;
+        socket.emit('answer_result', { correct: false, timeout: true });
+        handleWrongAnswer(code, socket.id);
+      }, timeoutMs);
+    }
 
     cb?.({ ok: true });
   });
 
-  // Player submits grid answer
   socket.on('submit_answer', ({ answer }, cb) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
-    if (!room || room.phase !== 'player_answering') return;
-    if (socket.id !== room.answeringPlayerId) return;
+    if (!room) return;
 
-    stopTimers(room);
+    const { mode } = room.settings;
     const { entry } = currentEntry(room);
     const correct = answer === entry.word;
 
-    socket.emit('answer_result', { correct, word: entry.word });
+    if (mode === 'chaos') {
+      if (!room.activeAnswerers[socket.id]) return;
+      clearTimeout(room.answerTimers[socket.id]);
+      delete room.answerTimers[socket.id];
+      delete room.activeAnswerers[socket.id];
 
-    if (correct) {
-      const points = Math.max(1, entry.clues.length - room.revealedClues.length + 1);
-      endRound(code, socket.id, points);
+      socket.emit('answer_result', { correct, word: entry.word });
+
+      if (correct) {
+        const points = Math.max(1, entry.clues.length - room.revealedClues.length + 1);
+        endRound(code, socket.id, points);
+      } else {
+        // Chaos: wrong but can buzz again immediately
+        io.to(code).emit('answer_failed', {
+          playerName: room.players[socket.id]?.name,
+          eliminated: false,
+          roomState: roomState(room),
+        });
+      }
+
     } else {
-      eliminateAndResume(code, socket.id);
+      if (room.phase !== 'player_answering' || socket.id !== room.answeringPlayerId) return;
+      if (room.answerTimer) { clearTimeout(room.answerTimer); room.answerTimer = null; }
+
+      socket.emit('answer_result', { correct, word: entry.word });
+
+      if (correct) {
+        const points = Math.max(1, entry.clues.length - room.revealedClues.length + 1);
+        endRound(code, socket.id, points);
+      } else {
+        handleWrongAnswer(code, socket.id);
+      }
     }
 
     cb?.({ ok: true });
@@ -272,13 +339,19 @@ io.on('connection', socket => {
     if (!room) return;
 
     if (socket.id === room.hostSocketId) {
-      stopTimers(room);
+      stopAllTimers(room);
       io.to(code).emit('game_ended', { reason: 'המארח התנתק' });
       delete rooms[code];
     } else {
+      // Clean up chaos timers for this player
+      if (room.answerTimers?.[socket.id]) {
+        clearTimeout(room.answerTimers[socket.id]);
+        delete room.answerTimers[socket.id];
+        delete room.activeAnswerers[socket.id];
+      }
       delete room.players[socket.id];
       if (room.answeringPlayerId === socket.id && room.phase === 'player_answering') {
-        eliminateAndResume(code, socket.id);
+        handleWrongAnswer(code, socket.id);
       } else {
         io.to(code).emit('room_updated', roomState(room));
       }
