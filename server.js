@@ -42,8 +42,10 @@ function createRoom(hostSocketId, settings = {}) {
     hostSocketId,
     phase: 'lobby',       // lobby | clues_running | player_answering | round_over
     settings: {
-      answerTimeout: settings.answerTimeout || 10, // seconds
-      mode: settings.mode || 'hard',               // easy | hard | chaos
+      answerTimeout:     settings.answerTimeout     || 10,
+      mode:              settings.mode              || 'hard',
+      autoContinue:      settings.autoContinue      ?? true,
+      autoContinueDelay: settings.autoContinueDelay || 10,
     },
     players: {},           // socketId → { name, score, eliminatedThisRound }
     wordQueue: shuffle(Object.keys(dictionary)),
@@ -58,6 +60,7 @@ function createRoom(hostSocketId, settings = {}) {
     activeAnswerers: {},   // socketId → true
     answerTimers: {},      // socketId → timeout handle
     clueTimer: null,
+    autoContinueTimer: null,
   };
   return code;
 }
@@ -90,8 +93,9 @@ function roomState(room) {
 
 // ── Timer helpers ──────────────────────────────────────────────────────────
 function stopAllTimers(room) {
-  if (room.clueTimer)  { clearTimeout(room.clueTimer);  room.clueTimer  = null; }
-  if (room.answerTimer){ clearTimeout(room.answerTimer); room.answerTimer = null; }
+  if (room.clueTimer)        { clearTimeout(room.clueTimer);        room.clueTimer        = null; }
+  if (room.answerTimer)      { clearTimeout(room.answerTimer);      room.answerTimer      = null; }
+  if (room.autoContinueTimer){ clearTimeout(room.autoContinueTimer); room.autoContinueTimer = null; }
   for (const id of Object.keys(room.answerTimers || {})) clearTimeout(room.answerTimers[id]);
   room.answerTimers = {};
   room.activeAnswerers = {};
@@ -142,6 +146,15 @@ function endRound(roomCode, winnerId, points) {
     points,
     roomState: roomState(room),
   });
+
+  // Auto-continue: schedule next round automatically
+  const { autoContinue, autoContinueDelay } = room.settings;
+  if (autoContinue && Object.keys(room.players).length > 0) {
+    io.to(roomCode).emit('auto_continue_started', { delay: autoContinueDelay });
+    room.autoContinueTimer = setTimeout(() => {
+      if (rooms[roomCode]?.phase === 'round_over') startRound(roomCode);
+    }, autoContinueDelay * 1000);
+  }
 }
 
 // Called after a wrong answer in easy/hard mode
@@ -169,6 +182,36 @@ function handleWrongAnswer(roomCode, playerId) {
   });
 
   scheduleNextClue(roomCode);
+}
+
+// ── Start round logic (used by socket handler + auto-continue) ────────────────
+function startRound(roomCode) {
+  const room = rooms[roomCode];
+  if (!room) return 'חדר לא נמצא';
+  if (!['lobby', 'round_over'].includes(room.phase)) return 'לא ניתן כרגע';
+  if (Object.keys(room.players).length === 0) return 'צריך לפחות שחקן אחד';
+
+  if (room.roundNumber > 0) room.wordQueueIndex++;
+  room.roundNumber++;
+  room.phase = 'clues_running';
+  room.currentClueIndex = 0;
+  room.revealedClues = [];
+  room.answeringPlayerId = null;
+  stopAllTimers(room); // also clears autoContinueTimer
+
+  for (const pid of Object.keys(room.players)) {
+    room.players[pid].eliminatedThisRound = false;
+  }
+
+  const { entry } = currentEntry(room);
+  io.to(roomCode).emit('round_started', {
+    roundNumber: room.roundNumber,
+    totalClues: entry.clues.length,
+    roomState: roomState(room),
+  });
+
+  scheduleNextClue(roomCode);
+  return null; // no error
 }
 
 // ── Socket events ──────────────────────────────────────────────────────────
@@ -203,30 +246,31 @@ io.on('connection', socket => {
   socket.on('start_round', (_, cb) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
+    if (!room || socket.id !== room.hostSocketId) return cb?.({ error: 'לא מארח' });
+    const err = startRound(code);
+    cb?.(err ? { error: err } : { ok: true });
+  });
+
+  socket.on('pause_auto_continue', (_, cb) => {
+    const code = socket.data.roomCode;
+    const room = rooms[code];
     if (!room || socket.id !== room.hostSocketId) return;
-    if (!['lobby', 'round_over'].includes(room.phase)) return cb?.({ error: 'לא ניתן כרגע' });
-    if (Object.keys(room.players).length === 0) return cb?.({ error: 'צריך לפחות שחקן אחד' });
+    if (room.autoContinueTimer) { clearTimeout(room.autoContinueTimer); room.autoContinueTimer = null; }
+    io.to(code).emit('auto_continue_paused');
+    cb?.({ ok: true });
+  });
 
-    if (room.roundNumber > 0) room.wordQueueIndex++;
-    room.roundNumber++;
-    room.phase = 'clues_running';
-    room.currentClueIndex = 0;
-    room.revealedClues = [];
-    room.answeringPlayerId = null;
-    stopAllTimers(room);
-
-    for (const pid of Object.keys(room.players)) {
-      room.players[pid].eliminatedThisRound = false;
-    }
-
-    const { entry } = currentEntry(room);
-    io.to(code).emit('round_started', {
-      roundNumber: room.roundNumber,
-      totalClues: entry.clues.length,
-      roomState: roomState(room),
-    });
-
-    scheduleNextClue(code);
+  socket.on('resume_auto_continue', (_, cb) => {
+    const code = socket.data.roomCode;
+    const room = rooms[code];
+    if (!room || socket.id !== room.hostSocketId) return;
+    if (room.phase !== 'round_over') return;
+    const delay = room.settings.autoContinueDelay;
+    if (room.autoContinueTimer) clearTimeout(room.autoContinueTimer);
+    io.to(code).emit('auto_continue_started', { delay });
+    room.autoContinueTimer = setTimeout(() => {
+      if (rooms[code]?.phase === 'round_over') startRound(code);
+    }, delay * 1000);
     cb?.({ ok: true });
   });
 
@@ -302,7 +346,7 @@ io.on('connection', socket => {
       delete room.answerTimers[socket.id];
       delete room.activeAnswerers[socket.id];
 
-      socket.emit('answer_result', { correct, word: entry.word });
+      socket.emit('answer_result', { correct, ...(correct ? { word: entry.word } : {}) });
 
       if (correct) {
         const points = Math.max(1, entry.clues.length - room.revealedClues.length + 1);
@@ -320,7 +364,7 @@ io.on('connection', socket => {
       if (room.phase !== 'player_answering' || socket.id !== room.answeringPlayerId) return;
       if (room.answerTimer) { clearTimeout(room.answerTimer); room.answerTimer = null; }
 
-      socket.emit('answer_result', { correct, word: entry.word });
+      socket.emit('answer_result', { correct, ...(correct ? { word: entry.word } : {}) });
 
       if (correct) {
         const points = Math.max(1, entry.clues.length - room.revealedClues.length + 1);
