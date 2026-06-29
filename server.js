@@ -382,6 +382,60 @@ io.on('connection', socket => {
     cb?.({ ok: true });
   });
 
+
+  // Player voluntarily leaves (back to home screen)
+  socket.on('leave_game', (_, cb) => {
+    const code = socket.data?.roomCode;
+    const room = rooms[code];
+
+    // Leave the socket.io room immediately — no more broadcast events reach this socket
+    socket.leave(code);
+    socket.data.roomCode = null;
+
+    if (!room) { cb?.({ ok: true }); return; }
+
+    // Clean up any chaos answer timers for this player
+    if (room.answerTimers?.[socket.id]) {
+      clearTimeout(room.answerTimers[socket.id]);
+      delete room.answerTimers[socket.id];
+    }
+    delete room.activeAnswerers[socket.id];
+
+    if (socket.id === room.hostSocketId) {
+      // Host leaving ends the session for everyone
+      stopAllTimers(room);
+      io.to(code).emit('game_ended', { reason: 'המארח עזב את המשחק' });
+      delete rooms[code];
+    } else {
+      const wasAnswering = room.answeringPlayerId === socket.id && room.phase === 'player_answering';
+      const playerName = room.players[socket.id]?.name;
+      delete room.players[socket.id];
+
+      if (wasAnswering) {
+        // Resume as if they timed out
+        room.answeringPlayerId = null;
+        if (room.answerTimer) { clearTimeout(room.answerTimer); room.answerTimer = null; }
+        const active = Object.values(room.players).filter(p => !p.eliminatedThisRound);
+        if (active.length === 0) {
+          endRound(code, null, 0);
+        } else {
+          room.phase = 'clues_running';
+          io.to(code).emit('answer_failed', { playerName, eliminated: false, roomState: roomState(room) });
+          scheduleNextClue(code);
+        }
+      } else {
+        // Check if everyone is now eliminated
+        const active = Object.values(room.players).filter(p => !p.eliminatedThisRound);
+        if (active.length === 0 && room.phase === 'clues_running') {
+          endRound(code, null, 0);
+        } else {
+          io.to(code).emit('room_updated', roomState(room));
+        }
+      }
+    }
+    cb?.({ ok: true });
+  });
+
   socket.on('disconnect', () => {
     const code = socket.data?.roomCode;
     const room = rooms[code];
