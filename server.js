@@ -18,23 +18,14 @@ const PORT = process.env.PORT || 3002;
 
 const CLUE_INTERVAL_MS = 3500;
 const GRACE_PERIOD_MS  = 6000;
+const HOST_RECONNECT_GRACE_MS = 5 * 60 * 1000; // 5 minutes
 
 // ── Dictionary loading ─────────────────────────────────────────────────────────
-// All .json files in data/ are loaded automatically.
-// To add a new category: just drop a new file into data/ and redeploy.
 function loadDictionaries() {
   const dataDir = path.join(__dirname, 'data');
   const entries = [];
-
-  if (!fs.existsSync(dataDir)) {
-    console.error('⚠ No data/ directory found — no words will be loaded');
-    return entries;
-  }
-
-  const files = fs.readdirSync(dataDir)
-    .filter(f => f.endsWith('.json') && f !== 'README.md')
-    .sort();
-
+  if (!fs.existsSync(dataDir)) { console.error('⚠ No data/ directory found'); return entries; }
+  const files = fs.readdirSync(dataDir).filter(f => f.endsWith('.json') && f !== 'README.md').sort();
   for (const file of files) {
     try {
       const raw = fs.readFileSync(path.join(dataDir, file), 'utf-8');
@@ -42,30 +33,19 @@ function loadDictionaries() {
       const fileEntries = Array.isArray(data.entries) ? data.entries : [];
       const cat = data.category_name
         || (typeof data.category === 'object' ? data.category?.name : data.category)
-        || data.category_id
-        || file;
-
+        || data.category_id || file;
       for (const e of fileEntries) {
         if (!e.answer || !Array.isArray(e.clues) || !Array.isArray(e.grid)) continue;
-        entries.push({
-          word:     e.answer,            // the correct answer
-          clues:    e.clues,             // array of 10, hard→easy
-          grid:     e.grid,              // array of 32; grid[0] === answer
-          category: e.category_name || cat,
-        });
+        entries.push({ word: e.answer, clues: e.clues, grid: e.grid, category: e.category_name || cat });
       }
       console.log(`  ✓ ${file}: ${fileEntries.length} entries (${cat})`);
-    } catch (err) {
-      console.error(`  ✗ ${file}: ${err.message}`);
-    }
+    } catch (err) { console.error(`  ✗ ${file}: ${err.message}`); }
   }
-
   return entries;
 }
-
-console.log('Loading dictionaries from data/...');
+console.log('Loading dictionaries...');
 const DICTIONARY = loadDictionaries();
-console.log(`Total: ${DICTIONARY.length} words across ${DICTIONARY.length > 0 ? 'loaded' : 'NO'} categories\n`);
+console.log(`Total: ${DICTIONARY.length} words\n`);
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 const LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -84,11 +64,13 @@ function shuffle(arr) {
 // ── Room store ─────────────────────────────────────────────────────────────────
 const rooms = {};
 
-function createRoom(hostSocketId, settings = {}) {
+function createRoom(hostSocketId, hostName, settings = {}) {
   const code = generateCode();
   rooms[code] = {
     code,
     hostSocketId,
+    hostName,            // used to identify host on rejoin
+    hostConnected: true,
     phase: 'lobby',
     settings: {
       answerTimeout:     settings.answerTimeout     || 10,
@@ -97,7 +79,8 @@ function createRoom(hostSocketId, settings = {}) {
       autoContinueDelay: settings.autoContinueDelay || 10,
     },
     players: {},
-    // Shuffle indices into DICTIONARY so each game uses a different word order
+    // Disconnected players saved by name so they can rejoin and recover their score
+    disconnectedPlayers: {}, // name → { score, wasHost, pendingNextTurn }
     wordQueue: shuffle([...Array(DICTIONARY.length).keys()]),
     wordQueueIndex: 0,
     roundNumber: 0,
@@ -109,11 +92,11 @@ function createRoom(hostSocketId, settings = {}) {
     answerTimers: {},
     clueTimer: null,
     autoContinueTimer: null,
+    cleanupTimer: null,   // fires to delete room if host never rejoins
   };
   return code;
 }
 
-// Returns the current dictionary entry for this room
 function currentEntry(room) {
   const idx = room.wordQueue[room.wordQueueIndex % room.wordQueue.length];
   return DICTIONARY[idx] || { word: '???', clues: Array(10).fill('...'), grid: [] };
@@ -124,15 +107,18 @@ function roomState(room) {
   const activeNames = mode === 'chaos'
     ? Object.keys(room.activeAnswerers).map(id => room.players[id]?.name).filter(Boolean)
     : (room.answeringPlayerId ? [room.players[room.answeringPlayerId]?.name].filter(Boolean) : []);
-
   return {
     code: room.code,
     phase: room.phase,
     roundNumber: room.roundNumber,
     settings: room.settings,
     hostSocketId: room.hostSocketId,
+    hostName: room.hostName,
+    hostConnected: room.hostConnected,
     players: Object.entries(room.players).map(([id, p]) => ({
-      id, name: p.name, score: p.score, eliminatedThisRound: p.eliminatedThisRound,
+      id, name: p.name, score: p.score,
+      eliminatedThisRound: p.eliminatedThisRound,
+      pendingNextTurn: p.pendingNextTurn || false,
     })),
     revealedClues: room.revealedClues,
     totalClues: currentEntry(room)?.clues?.length ?? 0,
@@ -145,6 +131,7 @@ function stopAllTimers(room) {
   if (room.clueTimer)        { clearTimeout(room.clueTimer);        room.clueTimer        = null; }
   if (room.answerTimer)      { clearTimeout(room.answerTimer);      room.answerTimer      = null; }
   if (room.autoContinueTimer){ clearTimeout(room.autoContinueTimer); room.autoContinueTimer = null; }
+  if (room.cleanupTimer)     { clearTimeout(room.cleanupTimer);     room.cleanupTimer     = null; }
   for (const id of Object.keys(room.answerTimers || {})) clearTimeout(room.answerTimers[id]);
   room.answerTimers = {};
   room.activeAnswerers = {};
@@ -153,27 +140,22 @@ function stopAllTimers(room) {
 function scheduleNextClue(roomCode) {
   const room = rooms[roomCode];
   if (!room || room.phase !== 'clues_running') return;
-
   const entry = currentEntry(room);
   const idx = room.currentClueIndex;
-
   if (idx >= entry.clues.length) {
     room.clueTimer = setTimeout(() => {
       if (rooms[roomCode]?.phase === 'clues_running') endRound(roomCode, null, 0);
     }, GRACE_PERIOD_MS);
     return;
   }
-
   const clue = entry.clues[idx];
   room.revealedClues.push({ index: idx, text: clue });
   room.currentClueIndex++;
-
   io.to(roomCode).emit('clue_revealed', {
     clueIndex: idx, clue,
     revealedClues: room.revealedClues,
     totalClues: entry.clues.length,
   });
-
   room.clueTimer = setTimeout(() => scheduleNextClue(roomCode), CLUE_INTERVAL_MS);
 }
 
@@ -183,11 +165,7 @@ function endRound(roomCode, winnerId, points) {
   stopAllTimers(room);
   room.phase = 'round_over';
   room.answeringPlayerId = null;
-
-  if (winnerId && room.players[winnerId]) {
-    room.players[winnerId].score += points;
-  }
-
+  if (winnerId && room.players[winnerId]) room.players[winnerId].score += points;
   const entry = currentEntry(room);
   io.to(roomCode).emit('round_over', {
     word: entry.word,
@@ -196,7 +174,7 @@ function endRound(roomCode, winnerId, points) {
     points,
     roomState: roomState(room),
   });
-
+  // Auto-continue: use all players (including pending ones — they'll be active next turn)
   const { autoContinue, autoContinueDelay } = room.settings;
   if (autoContinue && Object.keys(room.players).length > 0) {
     io.to(roomCode).emit('auto_continue_started', { delay: autoContinueDelay });
@@ -209,26 +187,22 @@ function endRound(roomCode, winnerId, points) {
 function handleWrongAnswer(roomCode, playerId) {
   const room = rooms[roomCode];
   if (!room) return;
-
   const { mode } = room.settings;
   const eliminated = mode === 'hard';
-
   room.answeringPlayerId = null;
   room.answerTimer = null;
-
   if (eliminated && room.players[playerId]) {
     room.players[playerId].eliminatedThisRound = true;
-    const active = Object.values(room.players).filter(p => !p.eliminatedThisRound);
+    // Only count non-pending players for elimination check
+    const active = Object.values(room.players).filter(p => !p.eliminatedThisRound && !p.pendingNextTurn);
     if (active.length === 0) { endRound(roomCode, null, 0); return; }
   }
-
   room.phase = 'clues_running';
   io.to(roomCode).emit('answer_failed', {
     playerName: room.players[playerId]?.name,
     eliminated,
     roomState: roomState(room),
   });
-
   scheduleNextClue(roomCode);
 }
 
@@ -237,7 +211,6 @@ function startRound(roomCode) {
   const room = rooms[roomCode];
   if (!room) return 'חדר לא נמצא';
   if (!['lobby', 'round_over'].includes(room.phase)) return 'לא ניתן כרגע';
-
   if (room.roundNumber > 0) room.wordQueueIndex++;
   room.roundNumber++;
   room.phase = 'clues_running';
@@ -245,11 +218,10 @@ function startRound(roomCode) {
   room.revealedClues = [];
   room.answeringPlayerId = null;
   stopAllTimers(room);
-
   for (const pid of Object.keys(room.players)) {
     room.players[pid].eliminatedThisRound = false;
+    room.players[pid].pendingNextTurn = false; // pending players become active on new round
   }
-
   const entry = currentEntry(room);
   io.to(roomCode).emit('round_started', {
     roundNumber: room.roundNumber,
@@ -257,7 +229,6 @@ function startRound(roomCode) {
     category: entry.category,
     roomState: roomState(room),
   });
-
   scheduleNextClue(roomCode);
   return null;
 }
@@ -266,31 +237,76 @@ function startRound(roomCode) {
 io.on('connection', socket => {
   console.log('connected:', socket.id);
 
+  // Host creates room
   socket.on('create_room', ({ playerName, settings } = {}, cb) => {
     const name = playerName?.trim() || 'מארח';
-    const code = createRoom(socket.id, settings || {});
+    const code = createRoom(socket.id, name, settings || {});
     socket.join(code);
     socket.data.roomCode = code;
     socket.data.isHost = true;
-    rooms[code].players[socket.id] = { name, score: 0, eliminatedThisRound: false };
+    rooms[code].players[socket.id] = { name, score: 0, eliminatedThisRound: false, pendingNextTurn: false };
     cb({ code, roomState: roomState(rooms[code]) });
-    console.log(`Room ${code} | host: ${name} | mode: ${rooms[code].settings.mode} | dict: ${DICTIONARY.length} words`);
+    console.log(`Room ${code} | host: ${name} | mode: ${rooms[code].settings.mode}`);
   });
 
+  // Player joins — handles both new joins AND reconnects (by name match in disconnectedPlayers)
   socket.on('join_room', ({ code, playerName }, cb) => {
-    const room = rooms[code?.toUpperCase()];
+    const roomCode = code?.toUpperCase();
+    const room = rooms[roomCode];
     if (!room) return cb({ error: 'חדר לא נמצא' });
     if (!playerName?.trim()) return cb({ error: 'נא להזין שם' });
-    if (room.phase !== 'lobby' && room.phase !== 'round_over')
-      return cb({ error: 'המשחק בעיצומו — הצטרפו בסיבוב הבא' });
-    socket.join(code.toUpperCase());
-    socket.data.roomCode = code.toUpperCase();
-    socket.data.isHost = false;
-    room.players[socket.id] = { name: playerName.trim(), score: 0, eliminatedThisRound: false };
-    cb({ roomState: roomState(room) });
-    io.to(code.toUpperCase()).emit('room_updated', roomState(room));
+    const name = playerName.trim();
+
+    // Check if reconnecting (name previously in this room)
+    const prevData = room.disconnectedPlayers[name];
+    const wasHost = prevData?.wasHost || false;
+
+    // Check for name collision with active player
+    const nameTaken = Object.values(room.players).some(p => p.name === name);
+    if (nameTaken && !prevData) {
+      return cb({ error: 'שם זה כבר בשימוש בחדר זה' });
+    }
+
+    socket.join(roomCode);
+    socket.data.roomCode = roomCode;
+    socket.data.isHost = wasHost;
+
+    // If reconnecting as host, restore host role
+    if (wasHost) {
+      room.hostSocketId = socket.id;
+      room.hostConnected = true;
+      if (room.cleanupTimer) { clearTimeout(room.cleanupTimer); room.cleanupTimer = null; }
+    }
+
+    // Pending if joining mid-game as a NEW player (not reconnecting)
+    const isMidGame = !['lobby', 'round_over'].includes(room.phase);
+    const pendingNextTurn = !wasHost && !prevData && isMidGame;
+
+    room.players[socket.id] = {
+      name,
+      score: prevData?.score || 0,
+      eliminatedThisRound: false,
+      pendingNextTurn,
+    };
+
+    // Clear from disconnected list
+    if (prevData) delete room.disconnectedPlayers[name];
+
+    cb({
+      roomState: roomState(room),
+      isHost: wasHost,
+      pendingNextTurn,
+      resumed: !!prevData,
+    });
+
+    if (wasHost) {
+      io.to(roomCode).emit('host_reconnected', { hostName: name, roomState: roomState(room) });
+    } else {
+      io.to(roomCode).emit('room_updated', roomState(room));
+    }
   });
 
+  // Host starts round
   socket.on('start_round', (_, cb) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
@@ -328,6 +344,8 @@ io.on('connection', socket => {
     if (!room) return cb?.({ error: 'חדר לא נמצא' });
     const player = room.players[socket.id];
     if (!player) return cb?.({ error: 'אינך רשום כשחקן' });
+    // Block pending players from buzzing
+    if (player.pendingNextTurn) return cb?.({ error: 'תצטרף לסיבוב הבא' });
     const { mode, answerTimeout } = room.settings;
     const timeoutMs = answerTimeout * 1000;
 
@@ -337,7 +355,6 @@ io.on('connection', socket => {
       room.activeAnswerers[socket.id] = true;
       const entry = currentEntry(room);
       io.to(code).emit('player_buzzed', { playerName: player.name, roomState: roomState(room) });
-      // Shuffle grid before sending — grid[0] is the answer but player sees it shuffled
       socket.emit('show_grid', { grid: shuffle(entry.grid), timeLimit: answerTimeout });
       room.answerTimers[socket.id] = setTimeout(() => {
         const r = rooms[code];
@@ -355,7 +372,6 @@ io.on('connection', socket => {
       room.answeringPlayerId = socket.id;
       const entry = currentEntry(room);
       io.to(code).emit('player_buzzed', { playerName: player.name, roomState: roomState(room) });
-      // Shuffle grid before sending
       socket.emit('show_grid', { grid: shuffle(entry.grid), timeLimit: answerTimeout });
       room.answerTimer = setTimeout(() => {
         const r = rooms[code];
@@ -374,7 +390,6 @@ io.on('connection', socket => {
     const { mode } = room.settings;
     const entry = currentEntry(room);
     const correct = answer === entry.word;
-
     if (mode === 'chaos') {
       if (!room.activeAnswerers[socket.id]) return;
       clearTimeout(room.answerTimers[socket.id]);
@@ -401,21 +416,20 @@ io.on('connection', socket => {
     cb?.({ ok: true });
   });
 
-  // Player voluntarily leaves (back to home screen)
+  // Voluntary leave (go home button)
   socket.on('leave_game', (_, cb) => {
     const code = socket.data?.roomCode;
     const room = rooms[code];
     socket.leave(code);
     socket.data.roomCode = null;
     if (!room) { cb?.({ ok: true }); return; }
-
     if (room.answerTimers?.[socket.id]) {
       clearTimeout(room.answerTimers[socket.id]);
       delete room.answerTimers[socket.id];
     }
     delete room.activeAnswerers[socket.id];
-
     if (socket.id === room.hostSocketId) {
+      // Host voluntarily left — end game
       stopAllTimers(room);
       io.to(code).emit('game_ended', { reason: 'המארח עזב את המשחק' });
       delete rooms[code];
@@ -426,7 +440,7 @@ io.on('connection', socket => {
       if (wasAnswering) {
         room.answeringPlayerId = null;
         if (room.answerTimer) { clearTimeout(room.answerTimer); room.answerTimer = null; }
-        const active = Object.values(room.players).filter(p => !p.eliminatedThisRound);
+        const active = Object.values(room.players).filter(p => !p.eliminatedThisRound && !p.pendingNextTurn);
         if (active.length === 0) {
           endRound(code, null, 0);
         } else {
@@ -435,7 +449,7 @@ io.on('connection', socket => {
           scheduleNextClue(code);
         }
       } else {
-        const active = Object.values(room.players).filter(p => !p.eliminatedThisRound);
+        const active = Object.values(room.players).filter(p => !p.eliminatedThisRound && !p.pendingNextTurn);
         if (active.length === 0 && room.phase === 'clues_running') {
           endRound(code, null, 0);
         } else {
@@ -446,25 +460,55 @@ io.on('connection', socket => {
     cb?.({ ok: true });
   });
 
+  // Accidental disconnect — save player data for potential rejoin
   socket.on('disconnect', () => {
     const code = socket.data?.roomCode;
     const room = rooms[code];
     if (!room) return;
+
+    const player = room.players[socket.id];
+    if (player) {
+      // Save for rejoin
+      room.disconnectedPlayers[player.name] = {
+        score: player.score,
+        wasHost: socket.id === room.hostSocketId,
+        pendingNextTurn: player.pendingNextTurn || false,
+      };
+    }
+
+    // Clean up chaos answer timers
+    if (room.answerTimers?.[socket.id]) {
+      clearTimeout(room.answerTimers[socket.id]);
+      delete room.answerTimers[socket.id];
+    }
+    delete room.activeAnswerers[socket.id];
+    delete room.players[socket.id];
+
     if (socket.id === room.hostSocketId) {
+      // Host disconnected — pause game, give grace period for reconnect
+      room.hostSocketId = null;
+      room.hostConnected = false;
       stopAllTimers(room);
-      io.to(code).emit('game_ended', { reason: 'המארח התנתק' });
-      delete rooms[code];
+      io.to(code).emit('host_disconnected', { roomState: roomState(room) });
+      // After grace period, end the game if host hasn't rejoined
+      room.cleanupTimer = setTimeout(() => {
+        const r = rooms[code];
+        if (r && !r.hostSocketId) {
+          io.to(code).emit('game_ended', { reason: 'המארח לא חזר — המשחק הסתיים' });
+          delete rooms[code];
+        }
+      }, HOST_RECONNECT_GRACE_MS);
     } else {
-      if (room.answerTimers?.[socket.id]) {
-        clearTimeout(room.answerTimers[socket.id]);
-        delete room.answerTimers[socket.id];
-        delete room.activeAnswerers[socket.id];
-      }
-      delete room.players[socket.id];
+      // Regular player disconnected
       if (room.answeringPlayerId === socket.id && room.phase === 'player_answering') {
         handleWrongAnswer(code, socket.id);
       } else {
-        io.to(code).emit('room_updated', roomState(room));
+        const active = Object.values(room.players).filter(p => !p.eliminatedThisRound && !p.pendingNextTurn);
+        if (active.length === 0 && room.phase === 'clues_running') {
+          endRound(code, null, 0);
+        } else {
+          io.to(code).emit('room_updated', roomState(room));
+        }
       }
     }
   });
