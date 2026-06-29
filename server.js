@@ -271,11 +271,21 @@ io.on('connection', socket => {
     socket.data.roomCode = roomCode;
     socket.data.isHost = wasHost;
 
-    // If reconnecting as host, restore host role
+    // If reconnecting as host, restore host role and resume game
     if (wasHost) {
       room.hostSocketId = socket.id;
       room.hostConnected = true;
       if (room.cleanupTimer) { clearTimeout(room.cleanupTimer); room.cleanupTimer = null; }
+      // Resume clue timer if game was running when host disconnected
+      if (room.phase === 'clues_running') {
+        scheduleNextClue(roomCode); // resumes from room.currentClueIndex
+      } else if (room.phase === 'player_answering') {
+        // The answering player's socket is gone — reset back to clues running
+        room.phase = 'clues_running';
+        room.answeringPlayerId = null;
+        io.to(roomCode).emit('answer_failed', { playerName: null, eliminated: false, roomState: roomState(room) });
+        scheduleNextClue(roomCode);
+      }
     }
 
     // Pending if joining mid-game as a NEW player (not reconnecting)
