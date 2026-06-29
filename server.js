@@ -40,25 +40,23 @@ function createRoom(hostSocketId, settings = {}) {
   rooms[code] = {
     code,
     hostSocketId,
-    phase: 'lobby',       // lobby | clues_running | player_answering | round_over
+    phase: 'lobby',
     settings: {
       answerTimeout:     settings.answerTimeout     || 10,
       mode:              settings.mode              || 'hard',
       autoContinue:      settings.autoContinue      ?? true,
       autoContinueDelay: settings.autoContinueDelay || 10,
     },
-    players: {},           // socketId → { name, score, eliminatedThisRound }
+    players: {},          // socketId → { name, score, eliminatedThisRound }
     wordQueue: shuffle(Object.keys(dictionary)),
     wordQueueIndex: 0,
     roundNumber: 0,
     currentClueIndex: 0,
     revealedClues: [],
-    // easy/hard: single answerer
     answeringPlayerId: null,
     answerTimer: null,
-    // chaos: multiple simultaneous answerers
-    activeAnswerers: {},   // socketId → true
-    answerTimers: {},      // socketId → timeout handle
+    activeAnswerers: {},
+    answerTimers: {},
     clueTimer: null,
     autoContinueTimer: null,
   };
@@ -72,7 +70,6 @@ function currentEntry(room) {
 
 function roomState(room) {
   const { mode } = room.settings;
-  // For host display: who is currently in the grid
   const activeNames = mode === 'chaos'
     ? Object.keys(room.activeAnswerers).map(id => room.players[id]?.name).filter(Boolean)
     : (room.answeringPlayerId ? [room.players[room.answeringPlayerId]?.name].filter(Boolean) : []);
@@ -82,6 +79,7 @@ function roomState(room) {
     phase: room.phase,
     roundNumber: room.roundNumber,
     settings: room.settings,
+    hostSocketId: room.hostSocketId,
     players: Object.entries(room.players).map(([id, p]) => ({
       id, name: p.name, score: p.score, eliminatedThisRound: p.eliminatedThisRound,
     })),
@@ -147,7 +145,7 @@ function endRound(roomCode, winnerId, points) {
     roomState: roomState(room),
   });
 
-  // Auto-continue: schedule next round automatically
+  // Auto-continue
   const { autoContinue, autoContinueDelay } = room.settings;
   if (autoContinue && Object.keys(room.players).length > 0) {
     io.to(roomCode).emit('auto_continue_started', { delay: autoContinueDelay });
@@ -157,7 +155,6 @@ function endRound(roomCode, winnerId, points) {
   }
 }
 
-// Called after a wrong answer in easy/hard mode
 function handleWrongAnswer(roomCode, playerId) {
   const room = rooms[roomCode];
   if (!room) return;
@@ -184,12 +181,11 @@ function handleWrongAnswer(roomCode, playerId) {
   scheduleNextClue(roomCode);
 }
 
-// ── Start round logic (used by socket handler + auto-continue) ────────────────
+// ── Start round (shared by socket handler + auto-continue) ──────────────────
 function startRound(roomCode) {
   const room = rooms[roomCode];
   if (!room) return 'חדר לא נמצא';
   if (!['lobby', 'round_over'].includes(room.phase)) return 'לא ניתן כרגע';
-  if (Object.keys(room.players).length === 0) return 'צריך לפחות שחקן אחד';
 
   if (room.roundNumber > 0) room.wordQueueIndex++;
   room.roundNumber++;
@@ -197,7 +193,7 @@ function startRound(roomCode) {
   room.currentClueIndex = 0;
   room.revealedClues = [];
   room.answeringPlayerId = null;
-  stopAllTimers(room); // also clears autoContinueTimer
+  stopAllTimers(room);
 
   for (const pid of Object.keys(room.players)) {
     room.players[pid].eliminatedThisRound = false;
@@ -211,28 +207,35 @@ function startRound(roomCode) {
   });
 
   scheduleNextClue(roomCode);
-  return null; // no error
+  return null;
 }
 
 // ── Socket events ──────────────────────────────────────────────────────────
 io.on('connection', socket => {
   console.log('connected:', socket.id);
 
-  socket.on('create_room', ({ settings } = {}, cb) => {
+  // Host creates room — host is also a player
+  socket.on('create_room', ({ playerName, settings } = {}, cb) => {
+    const name = playerName?.trim() || 'מארח';
     const code = createRoom(socket.id, settings || {});
     socket.join(code);
     socket.data.roomCode = code;
     socket.data.isHost = true;
+
+    // Host is a player like everyone else
+    rooms[code].players[socket.id] = { name, score: 0, eliminatedThisRound: false };
+
     cb({ code, roomState: roomState(rooms[code]) });
-    console.log(`Room ${code} created — mode: ${rooms[code].settings.mode}, timeout: ${rooms[code].settings.answerTimeout}s`);
+    console.log(`Room ${code} | host: ${name} | mode: ${rooms[code].settings.mode}`);
   });
 
+  // Player joins
   socket.on('join_room', ({ code, playerName }, cb) => {
     const room = rooms[code?.toUpperCase()];
     if (!room) return cb({ error: 'חדר לא נמצא' });
     if (!playerName?.trim()) return cb({ error: 'נא להזין שם' });
     if (room.phase !== 'lobby' && room.phase !== 'round_over')
-      return cb({ error: 'המשחק כבר בעיצומו — תצטרפו בסיבוב הבא' });
+      return cb({ error: 'המשחק בעיצומו — הצטרפו בסיבוב הבא' });
 
     socket.join(code.toUpperCase());
     socket.data.roomCode = code.toUpperCase();
@@ -243,14 +246,16 @@ io.on('connection', socket => {
     io.to(code.toUpperCase()).emit('room_updated', roomState(room));
   });
 
+  // Host starts round
   socket.on('start_round', (_, cb) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
-    if (!room || socket.id !== room.hostSocketId) return cb?.({ error: 'לא מארח' });
+    if (!room || socket.id !== room.hostSocketId) return cb?.({ error: 'רק המארח יכול להתחיל' });
     const err = startRound(code);
     cb?.(err ? { error: err } : { ok: true });
   });
 
+  // Host pauses auto-continue
   socket.on('pause_auto_continue', (_, cb) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
@@ -260,6 +265,7 @@ io.on('connection', socket => {
     cb?.({ ok: true });
   });
 
+  // Host resumes auto-continue (resets full delay)
   socket.on('resume_auto_continue', (_, cb) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
@@ -274,6 +280,7 @@ io.on('connection', socket => {
     cb?.({ ok: true });
   });
 
+  // Any player presses buzzer
   socket.on('press_buzzer', (_, cb) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
@@ -286,7 +293,6 @@ io.on('connection', socket => {
     const timeoutMs = answerTimeout * 1000;
 
     if (mode === 'chaos') {
-      // Chaos: clues keep running, multiple can buzz simultaneously
       if (room.phase !== 'clues_running') return cb?.({ error: 'לא ניתן כרגע' });
       if (room.activeAnswerers[socket.id]) return cb?.({ error: 'כבר בוחר תשובה' });
 
@@ -308,7 +314,6 @@ io.on('connection', socket => {
       }, timeoutMs);
 
     } else {
-      // Easy / Hard: pause clues, single answerer
       if (room.phase !== 'clues_running') return cb?.({ error: 'לא ניתן כרגע' });
       if (player.eliminatedThisRound) return cb?.({ error: 'אתה מחוץ לסיבוב הזה' });
 
@@ -331,6 +336,7 @@ io.on('connection', socket => {
     cb?.({ ok: true });
   });
 
+  // Player submits grid answer
   socket.on('submit_answer', ({ answer }, cb) => {
     const code = socket.data.roomCode;
     const room = rooms[code];
@@ -352,7 +358,6 @@ io.on('connection', socket => {
         const points = Math.max(1, entry.clues.length - room.revealedClues.length + 1);
         endRound(code, socket.id, points);
       } else {
-        // Chaos: wrong but can buzz again immediately
         io.to(code).emit('answer_failed', {
           playerName: room.players[socket.id]?.name,
           eliminated: false,
@@ -387,7 +392,6 @@ io.on('connection', socket => {
       io.to(code).emit('game_ended', { reason: 'המארח התנתק' });
       delete rooms[code];
     } else {
-      // Clean up chaos timers for this player
       if (room.answerTimers?.[socket.id]) {
         clearTimeout(room.answerTimers[socket.id]);
         delete room.answerTimers[socket.id];
@@ -403,4 +407,4 @@ io.on('connection', socket => {
   });
 });
 
-server.listen(PORT, () => console.log(`Buzzer server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Buzzer server on port ${PORT}`));
