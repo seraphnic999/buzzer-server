@@ -371,7 +371,9 @@ io.on('connection', socket => {
         if (!r || !r.activeAnswerers[socket.id]) return;
         delete r.activeAnswerers[socket.id];
         delete r.answerTimers[socket.id];
-        socket.emit('answer_result', { correct: false, timeout: true });
+        // -2 penalty for not answering in time
+        if (r.players[socket.id]) r.players[socket.id].score -= 2;
+        socket.emit('answer_result', { correct: false, timeout: true, penalty: -2 });
         io.to(code).emit('answer_failed', { playerName: player.name, eliminated: false, roomState: roomState(r) });
       }, timeoutMs);
     } else {
@@ -405,11 +407,13 @@ io.on('connection', socket => {
       clearTimeout(room.answerTimers[socket.id]);
       delete room.answerTimers[socket.id];
       delete room.activeAnswerers[socket.id];
-      socket.emit('answer_result', { correct, ...(correct ? { word: entry.word } : {}) });
+      socket.emit('answer_result', { correct, ...(correct ? { word: entry.word } : { penalty: -2 }) });
       if (correct) {
         const points = Math.max(1, entry.clues.length - room.revealedClues.length + 1);
         endRound(code, socket.id, points);
       } else {
+        // -2 penalty for wrong answer in chaos mode
+        if (room.players[socket.id]) room.players[socket.id].score -= 2;
         io.to(code).emit('answer_failed', { playerName: room.players[socket.id]?.name, eliminated: false, roomState: roomState(room) });
       }
     } else {
