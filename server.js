@@ -66,11 +66,13 @@ function shuffle(arr) {
   return a;
 }
 
-// Build a grid of exactly `size` items, always including the answer
+// Build a grid of exactly `size` items, always including the correct answer.
+// entry.grid[0] is always the answer (verified across all dictionary files).
+// We separate it out explicitly so smaller grids can never accidentally exclude it.
 function buildGrid(entry, size) {
-  const answer = entry.grid[0]; // grid[0] is always the answer word
-  const distractors = shuffle(entry.grid.slice(1)).slice(0, size - 1);
-  return shuffle([answer, ...distractors]);
+  const [answer, ...distractors] = entry.grid; // answer is always first
+  const picked = shuffle(distractors).slice(0, size - 1);
+  return shuffle([answer, ...picked]);
 }
 
 // Build a shuffled word-index queue filtered to selected categories (null = all)
