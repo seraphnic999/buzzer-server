@@ -61,6 +61,13 @@ function shuffle(arr) {
   return a;
 }
 
+// Build a grid of exactly `size` items, always including the answer
+function buildGrid(entry, size) {
+  const answer = entry.grid[0]; // grid[0] is always the answer word
+  const distractors = shuffle(entry.grid.slice(1)).slice(0, size - 1);
+  return shuffle([answer, ...distractors]);
+}
+
 // ── Room store ─────────────────────────────────────────────────────────────────
 const rooms = {};
 
@@ -77,6 +84,7 @@ function createRoom(hostSocketId, hostName, settings = {}) {
       mode:              settings.mode              || 'hard',
       autoContinue:      settings.autoContinue      ?? true,
       autoContinueDelay: settings.autoContinueDelay || 10,
+      gridSize:          settings.gridSize          || 32,
     },
     players: {},
     // Disconnected players saved by name so they can rejoin and recover their score
@@ -365,7 +373,7 @@ io.on('connection', socket => {
       room.activeAnswerers[socket.id] = true;
       const entry = currentEntry(room);
       io.to(code).emit('player_buzzed', { playerName: player.name, roomState: roomState(room) });
-      socket.emit('show_grid', { grid: shuffle(entry.grid), timeLimit: answerTimeout });
+      socket.emit('show_grid', { grid: buildGrid(entry, room.settings.gridSize), timeLimit: answerTimeout });
       room.answerTimers[socket.id] = setTimeout(() => {
         const r = rooms[code];
         if (!r || !r.activeAnswerers[socket.id]) return;
@@ -384,7 +392,7 @@ io.on('connection', socket => {
       room.answeringPlayerId = socket.id;
       const entry = currentEntry(room);
       io.to(code).emit('player_buzzed', { playerName: player.name, roomState: roomState(room) });
-      socket.emit('show_grid', { grid: shuffle(entry.grid), timeLimit: answerTimeout });
+      socket.emit('show_grid', { grid: buildGrid(entry, room.settings.gridSize), timeLimit: answerTimeout });
       room.answerTimer = setTimeout(() => {
         const r = rooms[code];
         if (!r || r.phase !== 'player_answering' || r.answeringPlayerId !== socket.id) return;
@@ -409,7 +417,7 @@ io.on('connection', socket => {
       delete room.activeAnswerers[socket.id];
       socket.emit('answer_result', { correct, ...(correct ? { word: entry.word } : { penalty: -2 }) });
       if (correct) {
-        const points = Math.max(1, entry.clues.length - room.revealedClues.length + 1);
+        const points = Math.max(3, entry.clues.length - room.revealedClues.length + 3);
         endRound(code, socket.id, points);
       } else {
         // -2 penalty for wrong answer in chaos mode
@@ -421,7 +429,7 @@ io.on('connection', socket => {
       if (room.answerTimer) { clearTimeout(room.answerTimer); room.answerTimer = null; }
       socket.emit('answer_result', { correct, ...(correct ? { word: entry.word } : {}) });
       if (correct) {
-        const points = Math.max(1, entry.clues.length - room.revealedClues.length + 1);
+        const points = Math.max(3, entry.clues.length - room.revealedClues.length + 3);
         endRound(code, socket.id, points);
       } else {
         handleWrongAnswer(code, socket.id);
