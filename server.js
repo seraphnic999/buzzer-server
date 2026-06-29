@@ -24,28 +24,33 @@ const HOST_RECONNECT_GRACE_MS = 5 * 60 * 1000; // 5 minutes
 function loadDictionaries() {
   const dataDir = path.join(__dirname, 'data');
   const entries = [];
-  if (!fs.existsSync(dataDir)) { console.error('⚠ No data/ directory found'); return entries; }
+  const categories = [];
+  if (!fs.existsSync(dataDir)) { console.error('⚠ No data/ directory found'); return { entries, categories }; }
   const files = fs.readdirSync(dataDir).filter(f => f.endsWith('.json') && f !== 'README.md').sort();
   for (const file of files) {
     try {
       const raw = fs.readFileSync(path.join(dataDir, file), 'utf-8');
       const data = JSON.parse(raw);
       const fileEntries = Array.isArray(data.entries) ? data.entries : [];
-      const cat = data.category_name
+      const catId   = data.category_id || file.replace('.json', '');
+      const catName = data.category_name
         || (typeof data.category === 'object' ? data.category?.name : data.category)
-        || data.category_id || file;
+        || catId;
+      let count = 0;
       for (const e of fileEntries) {
         if (!e.answer || !Array.isArray(e.clues) || !Array.isArray(e.grid)) continue;
-        entries.push({ word: e.answer, clues: e.clues, grid: e.grid, category: e.category_name || cat });
+        entries.push({ word: e.answer, clues: e.clues, grid: e.grid, category: catName, categoryId: catId });
+        count++;
       }
-      console.log(`  ✓ ${file}: ${fileEntries.length} entries (${cat})`);
+      categories.push({ id: catId, name: catName, count });
+      console.log(`  ✓ ${file}: ${count} entries (${catName})`);
     } catch (err) { console.error(`  ✗ ${file}: ${err.message}`); }
   }
-  return entries;
+  return { entries, categories };
 }
 console.log('Loading dictionaries...');
-const DICTIONARY = loadDictionaries();
-console.log(`Total: ${DICTIONARY.length} words\n`);
+const { entries: DICTIONARY, categories: CATEGORIES } = loadDictionaries();
+console.log(`Total: ${DICTIONARY.length} words across ${CATEGORIES.length} categories\n`);
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 const LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -68,6 +73,15 @@ function buildGrid(entry, size) {
   return shuffle([answer, ...distractors]);
 }
 
+// Build a shuffled word-index queue filtered to selected categories (null = all)
+function buildWordQueue(categories) {
+  const indices = (categories && categories.length > 0)
+    ? DICTIONARY.map((_, i) => i).filter(i => categories.includes(DICTIONARY[i].categoryId))
+    : [...Array(DICTIONARY.length).keys()];
+  // Fallback to full dictionary if no entries matched (bad category IDs)
+  return shuffle(indices.length > 0 ? indices : [...Array(DICTIONARY.length).keys()]);
+}
+
 // ── Room store ─────────────────────────────────────────────────────────────────
 const rooms = {};
 
@@ -85,11 +99,12 @@ function createRoom(hostSocketId, hostName, settings = {}) {
       autoContinue:      settings.autoContinue      ?? true,
       autoContinueDelay: settings.autoContinueDelay || 10,
       gridSize:          settings.gridSize          || 32,
+      categories:        settings.categories        || null, // null = all categories
     },
     players: {},
     // Disconnected players saved by name so they can rejoin and recover their score
     disconnectedPlayers: {}, // name → { score, wasHost, pendingNextTurn }
-    wordQueue: shuffle([...Array(DICTIONARY.length).keys()]),
+    wordQueue: buildWordQueue(settings.categories),
     wordQueueIndex: 0,
     roundNumber: 0,
     currentClueIndex: 0,
@@ -244,6 +259,11 @@ function startRound(roomCode) {
 // ── Socket events ──────────────────────────────────────────────────────────────
 io.on('connection', socket => {
   console.log('connected:', socket.id);
+
+  // Send available categories to host before room creation
+  socket.on('get_categories', (_, cb) => {
+    cb({ categories: CATEGORIES });
+  });
 
   // Host creates room
   socket.on('create_room', ({ playerName, settings } = {}, cb) => {
